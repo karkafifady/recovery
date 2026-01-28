@@ -5,272 +5,422 @@
     <title>Recovery Planner</title>
 
     <script src="./vendor/tailwindcss.js"></script>
-<script src="./vendor/react.development.js"></script>
-<script src="./vendor/react-dom.development.js"></script>
-<script src="./vendor/babel.min.js"></script>
-
+    <script src="./vendor/react.development.js"></script>
+    <script src="./vendor/react-dom.development.js"></script>
+    <script src="./vendor/babel.min.js"></script>
   </head>
 
   <body class="bg-gray-100">
     <div id="root"></div>
 
+    <!-- Load the app locally -->
     <script type="text/babel">
-      const { useMemo, useState } = React;
+const { useMemo, useState } = React;
 
-      // ---------- helpers ----------
-      function clamp(x, a, b) {
-        return Math.min(b, Math.max(a, x));
-      }
+// ---------------- helpers ----------------
+function clamp(x, a, b) { return Math.min(b, Math.max(a, x)); }
+function fmt(x, digits = 6) {
+  if (!Number.isFinite(x)) return "—";
+  const abs = Math.abs(x);
+  if (abs >= 1000) return x.toFixed(2);
+  if (abs >= 10) return x.toFixed(4);
+  return x.toFixed(digits);
+}
 
-      function fmt(x, digits = 6) {
-        if (!Number.isFinite(x)) return "—";
-        const abs = Math.abs(x);
-        if (abs >= 1000) return x.toFixed(2);
-        if (abs >= 10) return x.toFixed(4);
-        return x.toFixed(digits);
-      }
+// ---------------- fee-aware math ----------------
+// State:
+//   C = total spent including BUY fees
+//   Q = total quantity
+// Buy with cash I at price p:
+//   C <- C + I*(1+f)
+//   Q <- Q + I/p
+// Sell all at price p:
+//   proceeds = (1-f)*Q*p
+//   profit = proceeds - C
+//
+// Target profit (absolute):
+//   G = sellPct * I0
+// Target sell price:
+//   Ps = (C + G) / ((1-f)*Q)
+// Break-even price:
+//   P0 = C / ((1-f)*Q)
+//
+// Guarantee buy amount at price p with rebound rho:
+// Choose I so that selling at p*(1+rho) gives profit >= G:
+//   (1-f)*(Q + I/p)*p*(1+rho) = (C + I*(1+f)) + G
+// Solve for I:
+//   I * [ (1-f)(1+rho) - (1+f) ] = (C+G) - (1-f)Q p(1+rho)
+//   denom = (1-f)(1+rho) - (1+f)
+//   Iraw = ((C+G) - (1-f)*Q*p*(1+rho)) / denom
 
-      // ---------- core math (NO FEES MODEL) ----------
-      // Buy prices: p_k = p0*(1-L)^k
-      // Profit target: G = sellPct * I0 (absolute dollars)
-      // Guarantee buy at p: choose I so that at p*(1+rho), proceeds = C+G:
-      //   (Q + I/p)*p*(1+rho) = (C + I) + G
-      // => I = ((C+G) - p*(1+rho)*Q) / rho, clipped >=0
-      function simulateSchedule({ p0, I0, balance, M, L, rho, G, capToBalance }) {
-        if (!(p0 > 0) || !(I0 > 0) || !(balance > 0) || !(M >= 1) || !(rho > 0) || !(L >= 0 && L < 1)) {
-          return { ok: false, rows: [], totalCost: NaN, reason: "invalid parameters" };
+function denomFrom(f, rho) {
+  return (1 - f) * (1 + rho) - (1 + f);
+}
+
+function simulateBaseScheduleFee({ p0, I0, balance, M, L, rho, G }) {
+  // Pure schedule (NO cap) to test feasibility: if total cost > balance => doesn't fit
+  let C = 0, Q = 0;
+
+  // seed buy at p0
+  C = C + I0 * (1 + fGlob); // use global f? no; we pass f via closure below
+  Q = Q + I0 / p0;
+
+  const buyPrices = Array.from({ length: M }, (_, k) => p0 * Math.pow(1 - L, k));
+
+  // rebuys using guarantee engine
+  for (let k = 1; k < M; k++) {
+    const p = buyPrices[k];
+    const denom = denomFrom(fGlob, rho);
+    if (denom <= 0) return { ok: false, totalCost: Infinity, reason: "denom<=0 (rho too small for fee)" };
+
+    let Iraw = ((C + G) - (1 - fGlob) * Q * p * (1 + rho)) / denom;
+    if (!Number.isFinite(Iraw)) Iraw = 0;
+    Iraw = Math.max(0, Iraw);
+
+    C = C + Iraw * (1 + fGlob);
+    Q = Q + (Iraw > 0 ? Iraw / p : 0);
+
+    if (C > balance + 1e-9) return { ok: true, totalCost: C, fits: false };
+  }
+  return { ok: true, totalCost: C, fits: C <= balance + 1e-9 };
+}
+
+// We need f inside simulateBaseScheduleFee — easiest: store it in a global used only during rho search.
+let fGlob = 0.001;
+
+function findRhoFee({ p0, I0, balance, M, L, G, f }) {
+  fGlob = f;
+
+  // rho must satisfy denom>0  => rho > (1+f)/(1-f) - 1
+  const rhoLower = (1 + f) / (1 - f) - 1 + 1e-6;
+  const rhoMin = Math.max(rhoLower, 1e-6);
+  const rhoMax = 1.0;
+
+  // if even rhoMax doesn't fit => infeasible
+  const testMax = simulateBaseScheduleFee({ p0, I0, balance, M, L, rho: rhoMax, G });
+  if (!testMax.ok || !testMax.fits) {
+    return { reason: "infeasible: even rho=100% cannot fit schedule in balance" };
+  }
+
+  // binary search smallest rho that fits
+  let lo = rhoMin, hi = rhoMax, best = rhoMax;
+  for (let it = 0; it < 60; it++) {
+    const mid = (lo + hi) / 2;
+    const sim = simulateBaseScheduleFee({ p0, I0, balance, M, L, rho: mid, G });
+    if (sim.ok && sim.fits) { best = mid; hi = mid; } else { lo = mid; }
+  }
+
+  return { rho: best };
+}
+
+// ---------------- planner with overrides ----------------
+//
+// overrides[k] can contain:
+//   buyPrice: number
+//   buyCash: number
+//   sellPrice: number   (target sell override)
+//
+// rule: when any box is edited, we recompute all later rows based on the new (C,Q) state at that row.
+
+function buildPlanFee({ p0, I0, balance, M, L, rho, G, f, useHybridCap, overrides }) {
+  const rows = [];
+  const basePrices = Array.from({ length: M }, (_, k) => p0 * Math.pow(1 - L, k));
+  const denom = denomFrom(f, rho);
+  const denomOk = denom > 0;
+
+  let C = 0, Q = 0;
+
+  for (let k = 0; k < M; k++) {
+    const ov = overrides[k] || {};
+
+    const p = (Number.isFinite(ov.buyPrice) && ov.buyPrice > 0) ? ov.buyPrice : basePrices[k];
+
+    // buy cash
+    let I;
+    if (k === 0) {
+      I = (Number.isFinite(ov.buyCash) && ov.buyCash >= 0) ? ov.buyCash : I0;
+    } else {
+      if (!denomOk) {
+        I = 0;
+      } else {
+        const Iraw = ((C + G) - (1 - f) * Q * p * (1 + rho)) / denom;
+        const IrawPos = Math.max(0, Number.isFinite(Iraw) ? Iraw : 0);
+
+        I = (Number.isFinite(ov.buyCash) && ov.buyCash >= 0) ? ov.buyCash : IrawPos;
+
+        // hybrid cap (only if toggle ON)
+        if (useHybridCap) {
+          const Icap = Math.max(0, (balance - C) / (1 + f));
+          I = Math.min(I, Icap);
         }
-        if (balance < I0) {
-          return { ok: false, rows: [], totalCost: I0, reason: "balance < I0" };
-        }
-
-        const rows = [];
-        const buyPrices = Array.from({ length: M }, (_, k) => p0 * Math.pow(1 - L, k));
-
-        // state
-        let C = I0;         // total spent (no fees)
-        let Q = I0 / buyPrices[0];
-
-        // row 0
-        rows.push(makeRow(0, buyPrices[0], I0, C, Q, G));
-
-        // rebuys
-        for (let k = 1; k < M; k++) {
-          const p = buyPrices[k];
-
-          let Iraw = ((C + G) - p * (1 + rho) * Q) / rho;
-          if (!Number.isFinite(Iraw)) Iraw = 0;
-          Iraw = Math.max(0, Iraw);
-
-          let I = Iraw;
-          if (capToBalance) {
-            const Icap = Math.max(0, balance - C);
-            I = Math.min(I, Icap);
-          }
-
-          C = C + I;
-          Q = Q + (I > 0 ? I / p : 0);
-
-          rows.push(makeRow(k, p, I, C, Q, G));
-
-          if (C - balance > 1e-9) {
-            return { ok: false, rows, totalCost: C, reason: "exceeded balance" };
-          }
-        }
-
-        return { ok: true, rows, totalCost: C };
       }
+    }
 
-      function makeRow(k, buyPrice, buyCash, cumCost, cumQty, G) {
-        const P0 = cumCost / cumQty;          // break-even price (profit=0)
-        const Ps = (cumCost + G) / cumQty;    // target profit price (profit=G)
-        return {
-          k,
-          buyPrice,
-          buyCash,
-          cumCost,
-          cumQty,
-          breakEven_P0: P0,
-          targetSell_Ps: Ps,
-          profitAtP0: cumQty * P0 - cumCost,  // should be ~0
-          profitAtPs: cumQty * Ps - cumCost,  // should be ~G
-        };
-      }
+    // execute buy
+    C = C + I * (1 + f);
+    Q = Q + (I > 0 ? I / p : 0);
 
-      // Choose smallest rho so that schedule fits within balance (without clipping).
-      function findRho({ p0, I0, balance, M, L, G }) {
-        const rhoMin = 1e-6;
-        const rhoMax = 1.0;
+    // thresholds
+    const P0 = (Q > 0) ? (C / ((1 - f) * Q)) : NaN;
+    const Ps_calc = (Q > 0) ? ((C + G) / ((1 - f) * Q)) : NaN;
+    const Ps = (Number.isFinite(ov.sellPrice) && ov.sellPrice > 0) ? ov.sellPrice : Ps_calc;
 
-        const testMax = simulateSchedule({ p0, I0, balance, M, L, rho: rhoMax, G, capToBalance: false });
-        if (!testMax.ok || testMax.totalCost > balance + 1e-9) {
-          return { reason: "infeasible: even rho=100% needs more than the balance" };
-        }
+    const profitAtSell = (Q > 0) ? ((1 - f) * Q * Ps - C) : NaN;
+    const bouncePrice = p * (1 + rho);
+    const profitAtBounce = (Q > 0) ? ((1 - f) * Q * bouncePrice - C) : NaN;
 
-        // Binary search
-        let lo = rhoMin, hi = rhoMax, best = rhoMax;
-        for (let it = 0; it < 60; it++) {
-          const mid = (lo + hi) / 2;
-          const sim = simulateSchedule({ p0, I0, balance, M, L, rho: mid, G, capToBalance: false });
-          const fits = sim.ok && sim.totalCost <= balance + 1e-9;
-          if (fits) { best = mid; hi = mid; } else { lo = mid; }
-        }
+    rows.push({
+      k,
+      buyPrice: p,
+      buyCash: I,
+      cumCost: C,
+      cumQty: Q,
+      breakEven_P0: P0,
+      targetSell_Ps: Ps,
+      Ps_calc,
+      profitAtSell,
+      bouncePrice,
+      profitAtBounce,
+      denomOk,
+      capBound: useHybridCap && (C >= balance - 1e-9),
+    });
+  }
 
-        const finalSim = simulateSchedule({ p0, I0, balance, M, L, rho: best, G, capToBalance: false });
-        if (!finalSim.ok) return { reason: finalSim.reason || "failed" };
-        return { rho: best, rows: finalSim.rows };
-      }
+  return { rows, totalCost: C, denomOk };
+}
 
-      // ---------- UI ----------
-      function Field({ label, value, onChange, step }) {
-        return (
-          <label className="block">
-            <div className="mb-1 text-xs text-neutral-300">{label}</div>
-            <input
-              className="w-full rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 outline-none focus:border-neutral-600"
-              type="number"
-              step={step}
-              value={Number.isFinite(value) ? value : 0}
-              onChange={(e) => onChange(Number(e.target.value))}
-            />
-          </label>
-        );
-      }
+// ---------------- UI components ----------------
+function Field({ label, value, onChange, step }) {
+  return (
+    <label className="block">
+      <div className="mb-1 text-xs text-neutral-300">{label}</div>
+      <input
+        className="w-full rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 outline-none focus:border-neutral-600"
+        type="number"
+        step={step}
+        value={Number.isFinite(value) ? value : 0}
+        onChange={(e) => onChange(Number(e.target.value))}
+      />
+    </label>
+  );
+}
 
-      function Stat({ label, value }) {
-        return (
-          <div className="rounded-2xl bg-neutral-900/60 p-4">
-            <div className="text-xs text-neutral-300">{label}</div>
-            <div className="mt-1 font-mono text-lg text-neutral-100">{value}</div>
+function Stat({ label, value }) {
+  return (
+    <div className="rounded-2xl bg-neutral-900/60 p-4">
+      <div className="text-xs text-neutral-300">{label}</div>
+      <div className="mt-1 font-mono text-lg text-neutral-100">{value}</div>
+    </div>
+  );
+}
+
+function EditableBox({ value, onChange, className, step = 0.0001 }) {
+  return (
+    <input
+      className={className}
+      type="number"
+      step={step}
+      value={Number.isFinite(value) ? value : ""}
+      onChange={(e) => onChange(e.target.value === "" ? NaN : Number(e.target.value))}
+    />
+  );
+}
+
+function MartingaleRecoveryPlanner() {
+  const [initialPrice, setInitialPrice] = useState(100);
+  const [initialI0, setInitialI0] = useState(10);
+  const [balance, setBalance] = useState(100);
+  const [steps, setSteps] = useState(5);
+  const [buyPct, setBuyPct] = useState(20);
+  const [sellPct, setSellPct] = useState(20);
+
+  const [feePct, setFeePct] = useState(0); // NEW: fee in %
+  const [useHybridCap, setUseHybridCap] = useState(true);
+
+  // overrides: array length M, each entry {buyCash?, buyPrice?, sellPrice?}
+  const [overrides, setOverrides] = useState({}); // use object keyed by k
+
+  // when top params change (p0, M, etc.), reset overrides to avoid stale rows
+  function resetOverrides() {
+    setOverrides({});
+  }
+
+  const computed = useMemo(() => {
+    const p0 = Number(initialPrice);
+    const I0 = Number(initialI0);
+    const Cmax = Number(balance);
+    const M = Math.max(1, Math.floor(Number(steps)));
+    const L = clamp(Number(buyPct) / 100, 0, 0.999);
+    const f = clamp(Number(feePct) / 100, 0, 0.2);
+    const G = (Number(sellPct) / 100) * I0;
+
+    if (!(p0 > 0) || !(I0 > 0) || !(Cmax > 0) || !(M >= 1)) {
+      return { error: "please enter positive numbers" };
+    }
+
+    // compute rho automatically (fee-aware)
+    const rhoRes = findRhoFee({ p0, I0, balance: Cmax, M, L, G, f });
+    if (!rhoRes.rho) {
+      return { error: rhoRes.reason || "cannot compute rho" };
+    }
+    const rho = rhoRes.rho;
+
+    // build fee-aware plan with overrides + hybrid toggle
+    const plan = buildPlanFee({
+      p0, I0, balance: Cmax, M, L, rho, G, f,
+      useHybridCap,
+      overrides,
+    });
+
+    return { p0, I0, Cmax, M, L, f, G, rho, ...plan };
+  }, [initialPrice, initialI0, balance, steps, buyPct, sellPct, feePct, useHybridCap, overrides]);
+
+  function setOverride(k, patch) {
+    setOverrides((prev) => {
+      const next = { ...prev };
+      next[k] = { ...(next[k] || {}), ...patch };
+      return next;
+    });
+  }
+
+  function clearOverride(k, key) {
+    setOverrides((prev) => {
+      const next = { ...prev };
+      if (!next[k]) return prev;
+      const copy = { ...next[k] };
+      delete copy[key];
+      if (Object.keys(copy).length === 0) delete next[k];
+      else next[k] = copy;
+      return next;
+    });
+  }
+
+  return (
+    <div className="min-h-screen bg-neutral-950 text-neutral-100">
+      <div className="mx-auto max-w-6xl p-6">
+        <div className="mb-6 flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-2xl font-semibold">recovery planner (fee-aware)</h1>
+            <p className="mt-1 text-sm text-neutral-300">
+              edit any red/green box; rows after it recompute from the modified state.
+            </p>
           </div>
-        );
-      }
 
-      function MartingaleRecoveryPlanner() {
-        const [initialPrice, setInitialPrice] = useState(100);
-        const [initialI0, setInitialI0] = useState(10);
-        const [balance, setBalance] = useState(100);
-        const [steps, setSteps] = useState(5);     // M buys (seed + rebuys)
-        const [buyPct, setBuyPct] = useState(0.2); // L%
-        const [sellPct, setSellPct] = useState(0.2); // profit target = sellPct% of I0
-        const [useHybridCap, setUseHybridCap] = useState(true);
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              className="h-4 w-4"
+              checked={useHybridCap}
+              onChange={(e) => setUseHybridCap(e.target.checked)}
+            />
+            apply balance cap (hybrid)
+          </label>
+        </div>
 
-        const computed = useMemo(() => {
-          const p0 = Number(initialPrice);
-          const I0 = Number(initialI0);
-          const Cmax = Number(balance);
-          const M = Math.max(1, Math.floor(Number(steps)));
-          const L = clamp(Number(buyPct) / 100, 0, 0.999);
-          const G = (Number(sellPct) / 100) * I0;
+        <div className="grid grid-cols-1 gap-4 rounded-2xl bg-neutral-900/60 p-4 md:grid-cols-3">
+          <Field label="initial price p0" value={initialPrice} onChange={(v)=>{setInitialPrice(v); resetOverrides();}} step={0.0001} />
+          <Field label="initial invested I0 (pre-fee)" value={initialI0} onChange={(v)=>{setInitialI0(v); resetOverrides();}} step={0.01} />
+          <Field label="total invest / balance Cmax (incl fees)" value={balance} onChange={(v)=>{setBalance(v); resetOverrides();}} step={0.01} />
 
-          if (!(p0 > 0) || !(I0 > 0) || !(Cmax > 0) || !(M >= 1)) {
-            return { error: "please enter positive numbers" };
-          }
+          <Field label="steps of recovery (M buys)" value={steps} onChange={(v)=>{setSteps(v); resetOverrides();}} step={1} />
+          <Field label="threshold buy L (%)" value={buyPct} onChange={(v)=>{setBuyPct(v); resetOverrides();}} step={0.01} />
+          <Field label="target profit (% of I0)" value={sellPct} onChange={(v)=>{setSellPct(v); resetOverrides();}} step={0.01} />
 
-          const rhoRes = findRho({ p0, I0, balance: Cmax, M, L, G });
-          if (!rhoRes.rho || !rhoRes.rows) {
-            return { error: rhoRes.reason || "cannot compute rho" };
-          }
+          <Field label="fee per trade side f (%)" value={feePct} onChange={(v)=>{setFeePct(v); resetOverrides();}} step={0.001} />
+        </div>
 
-          const rho = rhoRes.rho;
-          const sim = simulateSchedule({ p0, I0, balance: Cmax, M, L, rho, G, capToBalance: useHybridCap });
-          if (!sim.ok) return { error: sim.reason || "simulation failed" };
+        {"error" in computed ? (
+          <div className="mt-4 rounded-xl border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-200">
+            {computed.error}
+          </div>
+        ) : (
+          <>
+            <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-3">
+              <Stat label="computed rho (guarantee rebound)" value={`${(computed.rho * 100).toFixed(4)} %`} />
+              <Stat label="profit target G (USD)" value={`$ ${fmt(computed.G, 6)}`} />
+              <Stat label="planned exposure (incl fees)" value={`$ ${fmt(computed.totalCost, 6)} / $ ${fmt(computed.Cmax, 6)}`} />
+            </div>
 
-          return { p0, I0, Cmax, M, L, G, rho, rows: sim.rows, totalCost: sim.totalCost };
-        }, [initialPrice, initialI0, balance, steps, buyPct, sellPct, useHybridCap]);
+            {!computed.denomOk ? (
+              <div className="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-200">
+                denom ≤ 0: rho is too small for the fee. increase rho / reduce fee.
+              </div>
+            ) : null}
 
-        return (
-          <div className="min-h-screen bg-neutral-950 text-neutral-100">
-            <div className="mx-auto max-w-6xl p-6">
-              <div className="mb-6 flex items-start justify-between gap-4">
-                <div>
-                  <h1 className="text-2xl font-semibold">recovery planner</h1>
-                  <p className="mt-1 text-sm text-neutral-300">
-                    computes <span className="font-mono">rho</span> automatically, then outputs buys + recovery sell levels.
-                  </p>
-                </div>
-                <label className="flex items-center gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    className="h-4 w-4"
-                    checked={useHybridCap}
-                    onChange={(e) => setUseHybridCap(e.target.checked)}
-                  />
-                  apply balance cap (hybrid)
-                </label>
+            <div className="mt-6 overflow-hidden rounded-2xl border border-neutral-800">
+              <div className="grid grid-cols-12 gap-2 bg-neutral-900 px-4 py-3 text-xs text-neutral-300">
+                <div className="col-span-1">k</div>
+                <div className="col-span-3">buy cash (editable)</div>
+                <div className="col-span-3">buy price (editable)</div>
+                <div className="col-span-5">sell all at (editable)</div>
               </div>
 
-              <div className="grid grid-cols-1 gap-4 rounded-2xl bg-neutral-900/60 p-4 md:grid-cols-3">
-                <Field label="initial price" value={initialPrice} onChange={setInitialPrice} step={0.0001} />
-                <Field label="initial invested I0" value={initialI0} onChange={setInitialI0} step={0.01} />
-                <Field label="total invest / balance" value={balance} onChange={setBalance} step={0.01} />
-                <Field label="steps of recovery (M buys)" value={steps} onChange={setSteps} step={1} />
-                <Field label="threshold buy L (%)" value={buyPct} onChange={setBuyPct} step={0.01} />
-                <Field label="target profit (% of I0)" value={sellPct} onChange={setSellPct} step={0.01} />
-              </div>
-
-              {"error" in computed ? (
-                <div className="mt-4 rounded-xl border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-200">
-                  {computed.error}
-                </div>
-              ) : (
-                <>
-                  <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-3">
-                    <Stat label="computed rho" value={`${(computed.rho * 100).toFixed(4)} %`} />
-                    <Stat label="profit target G" value={`$ ${fmt(computed.G, 6)}`} />
-                    <Stat label="planned exposure" value={`$ ${fmt(computed.totalCost, 6)} / $ ${fmt(computed.Cmax, 6)}`} />
-                  </div>
-
-                  <div className="mt-6 overflow-hidden rounded-2xl border border-neutral-800">
-                    <div className="grid grid-cols-12 gap-2 bg-neutral-900 px-4 py-3 text-xs text-neutral-300">
-                      <div className="col-span-1">k</div>
-                      <div className="col-span-3">buy cash</div>
-                      <div className="col-span-3">buy at price</div>
-                      <div className="col-span-5">sell all at (target)</div>
+              {computed.rows.map((r) => (
+                <div key={r.k} className="border-t border-neutral-800 bg-neutral-950">
+                  <div className="grid grid-cols-12 items-center gap-2 px-4 py-3">
+                    <div className="col-span-1 text-sm text-neutral-200">
+                      {r.k}{r.capBound ? <span className="ml-1 text-[10px] text-amber-300">(cap)</span> : null}
                     </div>
 
-                    {computed.rows.map((r) => (
-                      <div key={r.k} className="border-t border-neutral-800 bg-neutral-950">
-                        <div className="grid grid-cols-12 items-center gap-2 px-4 py-3">
-                          <div className="col-span-1 text-sm text-neutral-200">{r.k}</div>
-
-                          <div className="col-span-3">
-                            <div className="rounded-xl border border-red-500/40 bg-red-500/10 px-3 py-2 font-mono text-sm text-red-100">
-                              $ {fmt(r.buyCash)}
-                            </div>
-                          </div>
-
-                          <div className="col-span-3">
-                            <div className="rounded-xl border border-red-500/40 bg-red-500/10 px-3 py-2 font-mono text-sm text-red-100">
-                              p = {fmt(r.buyPrice)}
-                            </div>
-                          </div>
-
-                          <div className="col-span-5">
-                            <div className="rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 font-mono text-sm text-emerald-100">
-                              sell all at P = {fmt(r.targetSell_Ps)}
-                            </div>
-                            <div className="mt-1 text-[11px] text-neutral-400">
-                              break-even P0 = {fmt(r.breakEven_P0)} · profit@P0 = {fmt(r.profitAtP0, 10)} · profit@P = {fmt(r.profitAtPs, 10)}
-                            </div>
-                          </div>
-                        </div>
+                    {/* RED: buy cash editable */}
+                    <div className="col-span-3">
+                      <EditableBox
+                        value={r.buyCash}
+                        step={0.01}
+                        onChange={(v) => setOverride(r.k, { buyCash: v })}
+                        className="w-full rounded-xl border border-red-500/40 bg-red-500/10 px-3 py-2 font-mono text-sm text-red-100 outline-none"
+                      />
+                      <div className="mt-1 flex gap-2 text-[11px] text-neutral-400">
+                        <button className="underline" onClick={() => clearOverride(r.k, "buyCash")}>reset</button>
+                        <span>cum C={fmt(r.cumCost)} · Q={fmt(r.cumQty)}</span>
                       </div>
-                    ))}
-                  </div>
+                    </div>
 
-                  <div className="mt-6 rounded-2xl bg-neutral-900/60 p-4 text-xs text-neutral-300">
-                    note: keep for later.
+                    {/* RED: buy price editable */}
+                    <div className="col-span-3">
+                      <EditableBox
+                        value={r.buyPrice}
+                        step={0.0001}
+                        onChange={(v) => setOverride(r.k, { buyPrice: v })}
+                        className="w-full rounded-xl border border-red-500/40 bg-red-500/10 px-3 py-2 font-mono text-sm text-red-100 outline-none"
+                      />
+                      <div className="mt-1 text-[11px] text-neutral-400">
+                        bounce price p(1+rho)={fmt(r.bouncePrice)} · profit at bounce={fmt(r.profitAtBounce, 8)}
+                        {" · "}<button className="underline" onClick={() => clearOverride(r.k, "buyPrice")}>reset</button>
+                      </div>
+                    </div>
+
+                    {/* GREEN: sell price editable */}
+                    <div className="col-span-5">
+                      <EditableBox
+                        value={r.targetSell_Ps}
+                        step={0.0001}
+                        onChange={(v) => setOverride(r.k, { sellPrice: v })}
+                        className="w-full rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 font-mono text-sm text-emerald-100 outline-none"
+                      />
+                      <div className="mt-1 text-[11px] text-neutral-400">
+                        break-even P0={fmt(r.breakEven_P0)} · implied profit at sell={fmt(r.profitAtSell, 8)} · computed Ps={fmt(r.Ps_calc)}
+                        {" · "}<button className="underline" onClick={() => clearOverride(r.k, "sellPrice")}>reset</button>
+                      </div>
+                    </div>
                   </div>
-                </>
-              )}
+                </div>
+              ))}
             </div>
-          </div>
-        );
-      }
 
-      // Render
-      ReactDOM.createRoot(document.getElementById("root")).render(<MartingaleRecoveryPlanner />);
-    </script>
+            <div className="mt-6 rounded-2xl bg-neutral-900/60 p-4 text-xs text-neutral-300">
+              note: hybrid cap only clips buys when it would exceed balance. if rho is chosen to fit schedule, hybrid may look identical until you edit rows or change parameters.
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Render
+ReactDOM.createRoot(document.getElementById("root")).render(<MartingaleRecoveryPlanner />);
+
+</script>
   </body>
 </html>

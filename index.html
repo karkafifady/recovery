@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Recovery Planner</title>
+
+    <script src="./vendor/tailwindcss.js"></script>
+<script src="./vendor/react.development.js"></script>
+<script src="./vendor/react-dom.development.js"></script>
+<script src="./vendor/babel.min.js"></script>
+
+  </head>
+
+  <body class="bg-gray-100">
+    <div id="root"></div>
+
+    <script type="text/babel">
+      const { useMemo, useState } = React;
+
+      // ---------- helpers ----------
+      function clamp(x, a, b) {
+        return Math.min(b, Math.max(a, x));
+      }
+
+      function fmt(x, digits = 6) {
+        if (!Number.isFinite(x)) return "—";
+        const abs = Math.abs(x);
+        if (abs >= 1000) return x.toFixed(2);
+        if (abs >= 10) return x.toFixed(4);
+        return x.toFixed(digits);
+      }
+
+      // ---------- core math (NO FEES MODEL) ----------
+      // Buy prices: p_k = p0*(1-L)^k
+      // Profit target: G = sellPct * I0 (absolute dollars)
+      // Guarantee buy at p: choose I so that at p*(1+rho), proceeds = C+G:
+      //   (Q + I/p)*p*(1+rho) = (C + I) + G
+      // => I = ((C+G) - p*(1+rho)*Q) / rho, clipped >=0
+      function simulateSchedule({ p0, I0, balance, M, L, rho, G, capToBalance }) {
+        if (!(p0 > 0) || !(I0 > 0) || !(balance > 0) || !(M >= 1) || !(rho > 0) || !(L >= 0 && L < 1)) {
+          return { ok: false, rows: [], totalCost: NaN, reason: "invalid parameters" };
+        }
+        if (balance < I0) {
+          return { ok: false, rows: [], totalCost: I0, reason: "balance < I0" };
+        }
+
+        const rows = [];
+        const buyPrices = Array.from({ length: M }, (_, k) => p0 * Math.pow(1 - L, k));
+
+        // state
+        let C = I0;         // total spent (no fees)
+        let Q = I0 / buyPrices[0];
+
+        // row 0
+        rows.push(makeRow(0, buyPrices[0], I0, C, Q, G));
+
+        // rebuys
+        for (let k = 1; k < M; k++) {
+          const p = buyPrices[k];
+
+          let Iraw = ((C + G) - p * (1 + rho) * Q) / rho;
+          if (!Number.isFinite(Iraw)) Iraw = 0;
+          Iraw = Math.max(0, Iraw);
+
+          let I = Iraw;
+          if (capToBalance) {
+            const Icap = Math.max(0, balance - C);
+            I = Math.min(I, Icap);
+          }
+
+          C = C + I;
+          Q = Q + (I > 0 ? I / p : 0);
+
+          rows.push(makeRow(k, p, I, C, Q, G));
+
+          if (C - balance > 1e-9) {
+            return { ok: false, rows, totalCost: C, reason: "exceeded balance" };
+          }
+        }
+
+        return { ok: true, rows, totalCost: C };
+      }
+
+      function makeRow(k, buyPrice, buyCash, cumCost, cumQty, G) {
+        const P0 = cumCost / cumQty;          // break-even price (profit=0)
+        const Ps = (cumCost + G) / cumQty;    // target profit price (profit=G)
+        return {
+          k,
+          buyPrice,
+          buyCash,
+          cumCost,
+          cumQty,
+          breakEven_P0: P0,
+          targetSell_Ps: Ps,
+          profitAtP0: cumQty * P0 - cumCost,  // should be ~0
+          profitAtPs: cumQty * Ps - cumCost,  // should be ~G
+        };
+      }
+
+      // Choose smallest rho so that schedule fits within balance (without clipping).
+      function findRho({ p0, I0, balance, M, L, G }) {
+        const rhoMin = 1e-6;
+        const rhoMax = 1.0;
+
+        const testMax = simulateSchedule({ p0, I0, balance, M, L, rho: rhoMax, G, capToBalance: false });
+        if (!testMax.ok || testMax.totalCost > balance + 1e-9) {
+          return { reason: "infeasible: even rho=100% needs more than the balance" };
+        }
+
+        // Binary search
+        let lo = rhoMin, hi = rhoMax, best = rhoMax;
+        for (let it = 0; it < 60; it++) {
+          const mid = (lo + hi) / 2;
+          const sim = simulateSchedule({ p0, I0, balance, M, L, rho: mid, G, capToBalance: false });
+          const fits = sim.ok && sim.totalCost <= balance + 1e-9;
+          if (fits) { best = mid; hi = mid; } else { lo = mid; }
+        }
+
+        const finalSim = simulateSchedule({ p0, I0, balance, M, L, rho: best, G, capToBalance: false });
+        if (!finalSim.ok) return { reason: finalSim.reason || "failed" };
+        return { rho: best, rows: finalSim.rows };
+      }
+
+      // ---------- UI ----------
+      function Field({ label, value, onChange, step }) {
+        return (
+          <label className="block">
+            <div className="mb-1 text-xs text-neutral-300">{label}</div>
+            <input
+              className="w-full rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 outline-none focus:border-neutral-600"
+              type="number"
+              step={step}
+              value={Number.isFinite(value) ? value : 0}
+              onChange={(e) => onChange(Number(e.target.value))}
+            />
+          </label>
+        );
+      }
+
+      function Stat({ label, value }) {
+        return (
+          <div className="rounded-2xl bg-neutral-900/60 p-4">
+            <div className="text-xs text-neutral-300">{label}</div>
+            <div className="mt-1 font-mono text-lg text-neutral-100">{value}</div>
+          </div>
+        );
+      }
+
+      function MartingaleRecoveryPlanner() {
+        const [initialPrice, setInitialPrice] = useState(100);
+        const [initialI0, setInitialI0] = useState(10);
+        const [balance, setBalance] = useState(100);
+        const [steps, setSteps] = useState(5);     // M buys (seed + rebuys)
+        const [buyPct, setBuyPct] = useState(0.2); // L%
+        const [sellPct, setSellPct] = useState(0.2); // profit target = sellPct% of I0
+        const [useHybridCap, setUseHybridCap] = useState(true);
+
+        const computed = useMemo(() => {
+          const p0 = Number(initialPrice);
+          const I0 = Number(initialI0);
+          const Cmax = Number(balance);
+          const M = Math.max(1, Math.floor(Number(steps)));
+          const L = clamp(Number(buyPct) / 100, 0, 0.999);
+          const G = (Number(sellPct) / 100) * I0;
+
+          if (!(p0 > 0) || !(I0 > 0) || !(Cmax > 0) || !(M >= 1)) {
+            return { error: "please enter positive numbers" };
+          }
+
+          const rhoRes = findRho({ p0, I0, balance: Cmax, M, L, G });
+          if (!rhoRes.rho || !rhoRes.rows) {
+            return { error: rhoRes.reason || "cannot compute rho" };
+          }
+
+          const rho = rhoRes.rho;
+          const sim = simulateSchedule({ p0, I0, balance: Cmax, M, L, rho, G, capToBalance: useHybridCap });
+          if (!sim.ok) return { error: sim.reason || "simulation failed" };
+
+          return { p0, I0, Cmax, M, L, G, rho, rows: sim.rows, totalCost: sim.totalCost };
+        }, [initialPrice, initialI0, balance, steps, buyPct, sellPct, useHybridCap]);
+
+        return (
+          <div className="min-h-screen bg-neutral-950 text-neutral-100">
+            <div className="mx-auto max-w-6xl p-6">
+              <div className="mb-6 flex items-start justify-between gap-4">
+                <div>
+                  <h1 className="text-2xl font-semibold">recovery planner</h1>
+                  <p className="mt-1 text-sm text-neutral-300">
+                    computes <span className="font-mono">rho</span> automatically, then outputs buys + recovery sell levels.
+                  </p>
+                </div>
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4"
+                    checked={useHybridCap}
+                    onChange={(e) => setUseHybridCap(e.target.checked)}
+                  />
+                  apply balance cap (hybrid)
+                </label>
+              </div>
+
+              <div className="grid grid-cols-1 gap-4 rounded-2xl bg-neutral-900/60 p-4 md:grid-cols-3">
+                <Field label="initial price" value={initialPrice} onChange={setInitialPrice} step={0.0001} />
+                <Field label="initial invested I0" value={initialI0} onChange={setInitialI0} step={0.01} />
+                <Field label="total invest / balance" value={balance} onChange={setBalance} step={0.01} />
+                <Field label="steps of recovery (M buys)" value={steps} onChange={setSteps} step={1} />
+                <Field label="threshold buy L (%)" value={buyPct} onChange={setBuyPct} step={0.01} />
+                <Field label="target profit (% of I0)" value={sellPct} onChange={setSellPct} step={0.01} />
+              </div>
+
+              {"error" in computed ? (
+                <div className="mt-4 rounded-xl border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-200">
+                  {computed.error}
+                </div>
+              ) : (
+                <>
+                  <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-3">
+                    <Stat label="computed rho" value={`${(computed.rho * 100).toFixed(4)} %`} />
+                    <Stat label="profit target G" value={`$ ${fmt(computed.G, 6)}`} />
+                    <Stat label="planned exposure" value={`$ ${fmt(computed.totalCost, 6)} / $ ${fmt(computed.Cmax, 6)}`} />
+                  </div>
+
+                  <div className="mt-6 overflow-hidden rounded-2xl border border-neutral-800">
+                    <div className="grid grid-cols-12 gap-2 bg-neutral-900 px-4 py-3 text-xs text-neutral-300">
+                      <div className="col-span-1">k</div>
+                      <div className="col-span-3">buy cash</div>
+                      <div className="col-span-3">buy at price</div>
+                      <div className="col-span-5">sell all at (target)</div>
+                    </div>
+
+                    {computed.rows.map((r) => (
+                      <div key={r.k} className="border-t border-neutral-800 bg-neutral-950">
+                        <div className="grid grid-cols-12 items-center gap-2 px-4 py-3">
+                          <div className="col-span-1 text-sm text-neutral-200">{r.k}</div>
+
+                          <div className="col-span-3">
+                            <div className="rounded-xl border border-red-500/40 bg-red-500/10 px-3 py-2 font-mono text-sm text-red-100">
+                              $ {fmt(r.buyCash)}
+                            </div>
+                          </div>
+
+                          <div className="col-span-3">
+                            <div className="rounded-xl border border-red-500/40 bg-red-500/10 px-3 py-2 font-mono text-sm text-red-100">
+                              p = {fmt(r.buyPrice)}
+                            </div>
+                          </div>
+
+                          <div className="col-span-5">
+                            <div className="rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 font-mono text-sm text-emerald-100">
+                              sell all at P = {fmt(r.targetSell_Ps)}
+                            </div>
+                            <div className="mt-1 text-[11px] text-neutral-400">
+                              break-even P0 = {fmt(r.breakEven_P0)} · profit@P0 = {fmt(r.profitAtP0, 10)} · profit@P = {fmt(r.profitAtPs, 10)}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="mt-6 rounded-2xl bg-neutral-900/60 p-4 text-xs text-neutral-300">
+                    note: keep for later.
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        );
+      }
+
+      // Render
+      ReactDOM.createRoot(document.getElementById("root")).render(<MartingaleRecoveryPlanner />);
+    </script>
+  </body>
+</html>
